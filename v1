@@ -1,0 +1,300 @@
+/* ========== ESP32 + HUB75E(1/32) + WebSocket Chess (no legality, simple move) ==========
+   - Libraries:
+       ESP32-HUB75-MatrixPanel-I2S-DMA
+       ESP Async WebServer, AsyncTCP, ArduinoJson
+   - Panel: 64x64 HUB75E (E line 사용)
+   - Features:
+       * 체스판 색: light #F0D9B5 / dark #B58863
+       * 말 색: 흰/검
+       * From/To(e2 또는 1~64) 로 지정 위치 이동 (규칙 검증 없음, 캡처 허용)
+       * Render / Shift / Clear / Reset
+   - NOT included: 모든 규칙(합법검사, 캐슬링, 앙파상 등)
+   ======================================================================================= */
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+
+/*** ---- Wi-Fi ---- ***/
+const char* WIFI_SSID = "gyultaeS25";
+const char* WIFI_PASS = "955qjdn4ki25y8r";
+const char* HOSTNAME  = "esp32-matrix";
+
+/*** ---- Panel config ---- ***/
+#define PANEL_RES_X 64
+#define PANEL_RES_Y 64
+#define PANEL_CHAIN 1
+
+// 튜닝 스위치(필요 시 값만 바꿔서 업로드)
+#define SWAP_CLK_LAT   0   // 0: CLK=16/LAT=4, 1: CLK=4/LAT=16
+#define CLKPHASE_TRUE  1   // 세로줄 보이면 1
+#define USE_FM6126A    1   // 패널이 FM6126A면 1
+
+MatrixPanel_I2S_DMA* matrix = nullptr;
+
+/*** ---- Web ---- ***/
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+/*** ---- Web UI (이모지/특수문자 없이) ---- ***/
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+body{font-family:system-ui,Segoe UI,Arial;margin:18px;max-width:880px}
+input,button{font-size:16px} .row{margin:8px 0} button{margin-right:6px}
+.small{color:#444;font-size:13px}
+</style>
+<h2>ESP32 Matrix - Chessboard</h2>
+
+<div class=row>
+  Tiles per side: <input id=tiles type=number min=2 max=32 value=8>
+</div>
+<div class=row>
+  Square(px): <input id=sq type=number min=1 max=64 value=8>
+</div>
+<div class=row>
+  Color A: <input id=c1 type=color value="#F0D9B5">
+  &nbsp; Color B: <input id=c2 type=color value="#B58863">
+  &nbsp; Invert: <input id=inv type=checkbox>
+</div>
+<div class=row>
+  Offset X: <input id=ox type=number value=0> &nbsp; Offset Y: <input id=oy type=number value=0>
+</div>
+<div class=row>
+  <button onclick="sendBoard()">Render</button>
+  <button onclick="shift(-1,0)">Left</button>
+  <button onclick="shift(1,0)">Right</button>
+  <button onclick="shift(0,-1)">Up</button>
+  <button onclick="shift(0,1)">Down</button>
+  <button onclick="clearM()">Clear</button>
+  <button onclick="resetBoard()">Reset</button>
+</div>
+
+<hr>
+<h3>Move (no legality)</h3>
+<div class=row>
+  From: <input id=fm maxlength=2 size=3 placeholder="e2 or 13">
+  To: <input id=to maxlength=2 size=3 placeholder="e4 or 29">
+  <button onclick="move()">Move</button>
+</div>
+<div class="small">
+  - 좌표 표기: <b>e2</b> 같은 체스 표기 또는 <b>1~64</b> 숫자(1=좌상단, 64=우하단).<br>
+  - 규칙 검증 없음: 경로/턴 무시, 대상 칸에 말이 있으면 잡힙니다.
+</div>
+
+<script>
+let ws;
+function rgb(hex){ hex=hex.replace('#','');return [parseInt(hex.substr(0,2),16),parseInt(hex.substr(2,2),16),parseInt(hex.substr(4,2),16)]; }
+function openWS(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(proto+'://'+location.host+'/ws');
+  ws.onopen=()=>console.log('WS open');
+  ws.onclose=()=>setTimeout(openWS,1000);
+}
+openWS();
+
+function sendBoard(){
+  const msg={type:'board', tiles:parseInt(tiles.value), square:parseInt(sq.value),
+             c1:rgb(c1.value), c2:rgb(c2.value), invert:inv.checked,
+             ox:parseInt(ox.value)||0, oy:parseInt(oy.value)||0};
+  ws && ws.send(JSON.stringify(msg));
+}
+function shift(dx,dy){ ws && ws.send(JSON.stringify({type:'shift',dx,dy})); }
+function clearM(){ ws && ws.send(JSON.stringify({type:'clear'})); }
+function resetBoard(){ ws && ws.send(JSON.stringify({type:'reset'})); }
+function move(){
+  const f=fm.value.trim(), t=to.value.trim();
+  ws && ws.send(JSON.stringify({type:'moveAny', from:f, to:t}));
+}
+</script>
+)HTML";
+
+/*** ---- Board / sprites ---- ***/
+enum PieceColor { NONE_COLOR, WHITE, BLACK };
+enum PieceType  { NONE, PAWN, ROOK, QUEEN, KING, KNIGHT, BISHOP };
+struct Piece { PieceType t=NONE; PieceColor c=NONE_COLOR; };
+struct BoardCfg { uint8_t tiles=8, square=8; int16_t ox=0, oy=0; uint16_t c1, c2; bool invert=false; } cfg;
+
+#define BOARD_SIZE 8
+#define CELL_SIZE  8
+Piece board8[BOARD_SIZE][BOARD_SIZE];
+
+byte pawnSprite[8]={B00000000,B00011000,B00111100,B00111100,B00111100,B00011000,B00111100,B01111110};
+byte rookSprite[8]={B00000000,B11011011,B11011011,B11111111,B00111100,B00111100,B00111100,B01111110};
+byte queenSprite[8]={B00011000,B00111100,B00111100,B00011000,B10111101,B11111111,B11111111,B11111111};
+byte kingSprite[8]={B00011000,B00011000,B01111110,B01111110,B00011000,B00011000,B00111100,B01111110};
+byte knightSprite[8]={B00000010,B00000110,B00001111,B00111011,B11111111,B11111111,B00111111,B00000111};
+byte bishopSprite[8]={B00000000,B00011000,B00011000,B00111100,B00011100,B01101110,B01111110,B00111100};
+
+static inline const byte* spriteOf(PieceType t){
+  switch(t){case PAWN:return pawnSprite;case ROOK:return rookSprite;case QUEEN:return queenSprite;
+    case KING:return kingSprite;case KNIGHT:return knightSprite;case BISHOP:return bishopSprite; default:return nullptr;}
+}
+static inline int fileToX(char f){ return (f>='a'&&f<='h') ? (f-'a') : -1; }
+static inline int rankToY(char r){ return (r>='1'&&r<='8') ? (8-(r-'0')) : -1; } // '1'→7(top-down)
+static inline bool inBoard(int r,int c){ return r>=0&&r<8&&c>=0&&c<8; }
+
+// 숫자(1~64) → r,c (1=좌상단, 행우선)
+bool fromIndex1_64(int n, int &r, int &c){
+  if(n<1||n>64) return false;
+  n--; r = n/8; c = n%8; return true;
+}
+
+// "e2" 또는 "13" 등 문자열을 r,c 로
+bool parseSquare(const String& s, int &r, int &c){
+  if(s.length()==2 && isalpha(s[0]) && isdigit(s[1])){
+    int cc=fileToX(tolower(s[0])); int rr=rankToY(s[1]);
+    if(cc>=0&&rr>=0){ r=rr; c=cc; return true; }
+  }
+  // 숫자 모드
+  int n=0; for (size_t i=0;i<s.length();++i){ if(!isdigit(s[i])) return false; n=n*10+(s[i]-'0'); }
+  return fromIndex1_64(n,r,c);
+}
+
+void clearBoard(){ for(int r=0;r<8;r++) for(int c=0;c<8;c++) board8[r][c]={NONE,NONE_COLOR}; }
+void setupStart(){
+  clearBoard();
+  const PieceType order[8]={ROOK,KNIGHT,BISHOP,QUEEN,KING,BISHOP,KNIGHT,ROOK};
+  for(int x=0;x<8;x++){
+    board8[7][x]={order[x],WHITE}; board8[6][x]={PAWN,WHITE};
+    board8[0][x]={order[x],BLACK}; board8[1][x]={PAWN,BLACK};
+  }
+}
+
+static inline void fillRectClamped(int16_t x,int16_t y,int16_t w,int16_t h,uint16_t color){
+  if (x>=PANEL_RES_X || y>=PANEL_RES_Y) return;
+  int16_t x2=x+w; if (x2<=0||y+h<=0) return;
+  int16_t sx=max<int16_t>(0,x), sy=max<int16_t>(0,y);
+  int16_t ex=min<int16_t>(PANEL_RES_X,x2), ey=min<int16_t>(PANEL_RES_Y,y+h);
+  for(int16_t yy=sy; yy<ey; ++yy) matrix->drawFastHLine(sx, yy, ex-sx, color);
+}
+void drawSprite(const byte* spr,int x,int y,uint16_t col,int sq){
+  if(!spr) return; int sc=max(1, sq/CELL_SIZE);
+  int total=CELL_SIZE*sc, ox=(sq-total)/2, oy=(sq-total)/2;
+  int bx=x+ox, by=y+oy;
+  for(int r=0;r<CELL_SIZE;r++) for(int c=0;c<CELL_SIZE;c++){
+    if(!(spr[r] & (1<<(7-c)))) continue;
+    int px=bx+c*sc, py=by+r*sc; if(px>=PANEL_RES_X||py>=PANEL_RES_Y) continue;
+    for(int yy=0; yy<sc; ++yy) matrix->drawFastHLine(px, py+yy, sc, col);
+  }
+}
+
+void redraw(){
+  matrix->fillScreen(0);
+  int tiles = cfg.tiles<=0?8:cfg.tiles;
+  int sq    = cfg.square<=0?8:cfg.square;
+  int16_t sizeX=tiles*sq, sizeY=tiles*sq;
+  int16_t baseX=(PANEL_RES_X-sizeX)/2 + cfg.ox;
+  int16_t baseY=(PANEL_RES_Y-sizeY)/2 + cfg.oy;
+
+  for(int r=0;r<tiles;r++) for(int c=0;c<tiles;c++){
+    bool isA=((r+c)&1) ^ (cfg.invert?1:0);
+    uint16_t col = isA?cfg.c1:cfg.c2;
+    fillRectClamped(baseX+c*sq, baseY+r*sq, sq, sq, col);
+  }
+
+  // 중앙 8x8에 말 그리기
+  int stR=max(0,(tiles-8)/2), stC=max(0,(tiles-8)/2);
+  for(int r=0;r<8;r++) for(int c=0;c<8;c++){
+    Piece p=board8[r][c]; if(p.t==NONE) continue;
+    uint16_t col = (p.c==WHITE)?matrix->color565(255,255,255):matrix->color565(0,0,0);
+    int sx=baseX+(stC+c)*sq, sy=baseY+(stR+r)*sq;
+    drawSprite(spriteOf(p.t), sx, sy, col, sq);
+  }
+}
+
+/*** ---- WebSocket handlers ---- ***/
+void handleBoard(JsonDocument& d){
+  cfg.tiles  = constrain((int)d["tiles"], 2, 32);
+  cfg.square = constrain((int)d["square"], 1, 64);
+  cfg.ox = (int)d["ox"]; cfg.oy = (int)d["oy"]; cfg.invert = d["invert"] | false;
+  JsonArray a1=d["c1"], a2=d["c2"];
+  if(!a1.isNull()&&a1.size()==3) cfg.c1=matrix->color565(a1[0],a1[1],a1[2]);
+  if(!a2.isNull()&&a2.size()==3) cfg.c2=matrix->color565(a2[0],a2[1],a2[2]);
+  redraw();
+}
+void handleShift(JsonDocument& d){ cfg.ox+=(int)d["dx"]; cfg.oy+=(int)d["dy"]; redraw(); }
+void handleClear(JsonDocument&){ matrix->fillScreen(0); }
+void handleReset(JsonDocument&){ setupStart(); redraw(); }
+
+// 규칙검사 없이 이동: 범위만 확인, 캡처 허용
+void handleMoveAny(JsonDocument& d){
+  String fs = (const char*)(d["from"] | "");
+  String ts = (const char*)(d["to"]   | "");
+  int fr,fc,tr,tc;
+  if(!parseSquare(fs,fr,fc)) return;
+  if(!parseSquare(ts,tr,tc)) return;
+  if(!inBoard(fr,fc) || !inBoard(tr,tc)) return;
+  if(board8[fr][fc].t==NONE) return;       // 출발칸에 말이 없으면 무시
+  board8[tr][tc] = board8[fr][fc];         // 캡처 포함
+  board8[fr][fc] = {NONE,NONE_COLOR};
+  redraw();
+}
+
+void onWsMessage(void* arg,uint8_t* data,size_t len){
+  AwsFrameInfo* info=(AwsFrameInfo*)arg;
+  if(!info->final||info->index!=0||info->len!=len||info->opcode!=WS_TEXT) return;
+  DynamicJsonDocument doc(1024); if(deserializeJson(doc,data,len)) return;
+  const char* t=doc["type"]|"";
+  if(!strcmp(t,"board"))   handleBoard(doc);
+  else if(!strcmp(t,"shift"))  handleShift(doc);
+  else if(!strcmp(t,"clear"))  handleClear(doc);
+  else if(!strcmp(t,"reset"))  handleReset(doc);
+  else if(!strcmp(t,"moveAny")) handleMoveAny(doc);
+}
+void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c, AwsEventType type, void* arg, uint8_t* data, size_t len){
+  if(type==WS_EVT_DATA) onWsMessage(arg,data,len);
+}
+
+/*** ---- Setup & loop ---- ***/
+void setup(){
+  Serial.begin(115200);
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while(WiFi.status()!=WL_CONNECTED){ delay(200); Serial.print("."); }
+  Serial.println(); MDNS.begin(HOSTNAME);
+
+  // HUB75E 핀맵
+  HUB75_I2S_CFG p(PANEL_RES_X, PANEL_RES_Y, PANEL_CHAIN);
+  auto &g = p.gpio;
+  g.r1=26; g.g1=27; g.b1=25;
+  g.r2=12; g.g2=13; g.b2=14;
+  g.a=23; g.b=22; g.c=5; g.d=17; g.e=32;
+#if SWAP_CLK_LAT
+  g.clk=4;  g.lat=16;
+#else
+  g.clk=16; g.lat=4;
+#endif
+  g.oe=15;
+
+  p.latch_blanking = 1;
+  p.clkphase = CLKPHASE_TRUE;
+#if USE_FM6126A
+  p.driver = HUB75_I2S_CFG::FM6126A;
+#endif
+
+  matrix = new MatrixPanel_I2S_DMA(p);
+  matrix->begin();
+  matrix->setBrightness8(110);
+  matrix->fillScreen(0);
+
+  // 기본 색
+  cfg.c1=matrix->color565(0xF0,0xD9,0xB5);
+  cfg.c2=matrix->color565(0xB5,0x88,0x63);
+  cfg.tiles=8; cfg.square=8; cfg.ox=cfg.oy=0; cfg.invert=false;
+
+  setupStart();
+  redraw();
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req){ req->send(200, "text/html", INDEX_HTML); });
+  server.begin();
+}
+
+void loop(){ /* async */ }
