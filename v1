@@ -8,7 +8,8 @@
        * 말 색: 흰/검
        * From/To(e2 또는 1~64) 로 지정 위치 이동 (규칙 검증 없음, 캡처 허용)
        * Render / Shift / Clear / Reset
-   - NOT included: 모든 규칙(합법검사, 캐슬링, 앙파상 등)
+       * 폰 프로모션 지원(파이썬에서 UCI가 5글자면 promo 반영, 미지정시 기본 'q')
+   - NOT included: 합법검사, 캐슬링, 앙파상 표시 보정(원하면 추가 가능)
    ======================================================================================= */
 
 #include <WiFi.h>
@@ -17,6 +18,7 @@
 #include <AsyncTCP.h>
 #include <ArduinoJson.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <ctype.h> // isalpha, isdigit, tolower
 
 /*** ---- Wi-Fi ---- ***/
 const char* WIFI_SSID = "gyultaeS25";
@@ -39,7 +41,7 @@ MatrixPanel_I2S_DMA* matrix = nullptr;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-/*** ---- Web UI (이모지/특수문자 없이) ---- ***/
+/*** ---- Web UI ---- ***/
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <style>
@@ -130,8 +132,11 @@ byte knightSprite[8]={B00000010,B00000110,B00001111,B00111011,B11111111,B1111111
 byte bishopSprite[8]={B00000000,B00011000,B00011000,B00111100,B00011100,B01101110,B01111110,B00111100};
 
 static inline const byte* spriteOf(PieceType t){
-  switch(t){case PAWN:return pawnSprite;case ROOK:return rookSprite;case QUEEN:return queenSprite;
-    case KING:return kingSprite;case KNIGHT:return knightSprite;case BISHOP:return bishopSprite; default:return nullptr;}
+  switch(t){
+    case PAWN:return pawnSprite; case ROOK:return rookSprite; case QUEEN:return queenSprite;
+    case KING:return kingSprite; case KNIGHT:return knightSprite; case BISHOP:return bishopSprite;
+    default:return nullptr;
+  }
 }
 static inline int fileToX(char f){ return (f>='a'&&f<='h') ? (f-'a') : -1; }
 static inline int rankToY(char r){ return (r>='1'&&r<='8') ? (8-(r-'0')) : -1; } // '1'→7(top-down)
@@ -164,6 +169,7 @@ void setupStart(){
   }
 }
 
+// === Drawing helpers ===
 static inline void fillRectClamped(int16_t x,int16_t y,int16_t w,int16_t h,uint16_t color){
   if (x>=PANEL_RES_X || y>=PANEL_RES_Y) return;
   int16_t x2=x+w; if (x2<=0||y+h<=0) return;
@@ -220,29 +226,40 @@ void handleShift(JsonDocument& d){ cfg.ox+=(int)d["dx"]; cfg.oy+=(int)d["dy"]; r
 void handleClear(JsonDocument&){ matrix->fillScreen(0); }
 void handleReset(JsonDocument&){ setupStart(); redraw(); }
 
-// 규칙검사 없이 이동: 범위만 확인, 캡처 허용
+// 규칙검사 없이 이동: 범위만 확인, 캡처 허용 + 프로모션 지원
 void handleMoveAny(JsonDocument& d){
-  String fs = (const char*)(d["from"] | "");
-  String ts = (const char*)(d["to"]   | "");
-  int fr,fc,tr,tc;
-  if(!parseSquare(fs,fr,fc)) return;
-  if(!parseSquare(ts,tr,tc)) return;
-  if(!inBoard(fr,fc) || !inBoard(tr,tc)) return;
-  if(board8[fr][fc].t==NONE) return;       // 출발칸에 말이 없으면 무시
-  board8[tr][tc] = board8[fr][fc];         // 캡처 포함
-  board8[fr][fc] = {NONE,NONE_COLOR};
+  String fs=(const char*)(d["from"]|"");
+  String ts=(const char*)(d["to"]|"");
+  String promo=(const char*)(d["promo"]|""); // "q","r","b","n"
+  int fr,fc,tr,tc; if(!parseSquare(fs,fr,fc)||!parseSquare(ts,tr,tc)) return;
+  if(board8[fr][fc].t==NONE) return;
+
+  // 이동/캡처
+  board8[tr][tc] = board8[fr][fc];
+  board8[fr][fc] = {NONE, NONE_COLOR};
+
+  // 프로모션(끝 rank 도달한 폰)
+  if(board8[tr][tc].t==PAWN && (tr==0 || tr==7)){
+    char p = promo.length()? promo[0] : 'q';
+    switch(p){
+      case 'r': board8[tr][tc].t=ROOK;   break;
+      case 'b': board8[tr][tc].t=BISHOP; break;
+      case 'n': board8[tr][tc].t=KNIGHT; break;
+      default:  board8[tr][tc].t=QUEEN;  break;
+    }
+  }
   redraw();
 }
 
 void onWsMessage(void* arg,uint8_t* data,size_t len){
   AwsFrameInfo* info=(AwsFrameInfo*)arg;
   if(!info->final||info->index!=0||info->len!=len||info->opcode!=WS_TEXT) return;
-  DynamicJsonDocument doc(1024); if(deserializeJson(doc,data,len)) return;
+  DynamicJsonDocument doc(1536); if(deserializeJson(doc,data,len)) return;
   const char* t=doc["type"]|"";
-  if(!strcmp(t,"board"))   handleBoard(doc);
-  else if(!strcmp(t,"shift"))  handleShift(doc);
-  else if(!strcmp(t,"clear"))  handleClear(doc);
-  else if(!strcmp(t,"reset"))  handleReset(doc);
+  if(!strcmp(t,"board"))      handleBoard(doc);
+  else if(!strcmp(t,"shift")) handleShift(doc);
+  else if(!strcmp(t,"clear")) handleClear(doc);
+  else if(!strcmp(t,"reset")) handleReset(doc);
   else if(!strcmp(t,"moveAny")) handleMoveAny(doc);
 }
 void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c, AwsEventType type, void* arg, uint8_t* data, size_t len){
@@ -298,3 +315,4 @@ void setup(){
 }
 
 void loop(){ /* async */ }
+
