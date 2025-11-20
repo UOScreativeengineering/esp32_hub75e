@@ -1,0 +1,67 @@
+# =========================
+# FILE: esp32_ws.py
+# DESC: ESP32 WebSocket 클라이언트(백그라운드 재연결 + 전송 큐)
+# REQ : pip install websocket-client
+# USAGE: from esp32_ws import ESP32WS
+# ws = ESP32WS("ws://<ESP32_IP>/ws")
+# ws.move_any("e2e4")
+# =========================
+
+
+import json, time, threading, queue
+from websocket import create_connection
+
+
+class ESP32WS:
+def __init__(self, url: str, on_rx=None, autoconnect=True):
+self.url = url
+self.on_rx = on_rx
+self._tx = queue.Queue()
+self._ws = None
+self._running = False
+self._th = None
+self._lock = threading.Lock()
+if autoconnect:
+self.start()
+
+
+def start(self):
+if self._running: return
+self._running = True
+self._th = threading.Thread(target=self._loop, daemon=True)
+self._th.start()
+
+
+def stop(self):
+self._running = False
+with self._lock:
+try:
+if self._ws:
+self._ws.close()
+except:
+pass
+self._ws = None
+
+
+def send(self, obj: dict):
+"""연결 전이라도 큐에 넣어두면 연결되자마자 전송."""
+self._tx.put(obj)
+
+
+# ----- 편의 메서드 -----
+def send_board(self, tiles=8, square=8, c1=(0xF0,0xD9,0xB5), c2=(0xB5,0x88,0x63),
+invert=False, ox=0, oy=0):
+self.send({
+"type":"board","tiles":tiles,"square":square,
+"c1":list(c1),"c2":list(c2),"invert":invert,"ox":ox,"oy":oy
+})
+
+
+def reset(self):
+self.send({"type":"reset"})
+
+
+def move_any(self, uci: str):
+if not uci or len(uci) < 4: return
+self.send({"type":"moveAny","from":uci[:2],"to":uci[2:4]})
+self._ws = None
