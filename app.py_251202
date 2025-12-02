@@ -1,0 +1,49 @@
+from __future__ import annotations
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, "app"))
+
+import json
+import websocket  # pip install websocket-client 필요
+from app.gui.app import ChessApp as BaseChessApp
+
+
+def send_move_to_arduino(move: str) -> bool:
+
+    url = "ws://<IP address>/ws"
+
+    payload = {
+        "type": "moveAny",
+        "from": move[:2],  # 예: "e2"
+        "to": move[2:4],  # 예: "e4"
+        "promo": move[4:] if len(move) > 4 else ""  # 승급(q, r 등)
+    }
+
+    try:
+        ws = websocket.create_connection(url, timeout=1)
+        ws.send(json.dumps(payload))
+        ws.close()
+        return True
+    except Exception as exc:
+        print(f"[WebSocket Error] {exc}")
+        return False
+
+
+class ChessApp(BaseChessApp):
+    """GUI with optional Arduino integration."""
+
+    def _after_move_applied(self, uci: str, source: str) -> None:
+        # 사람(Human)이 둔 수만 아두이노로 전송합니다.
+        # AI끼리 두는 것을 전송하려면 이 조건을 수정하세요.
+        if source != "human":
+            return
+        success = send_move_to_arduino(uci)
+        if not success:
+            print("[WARNING] 아두이노로 전송되지 않음")
+
+
+if __name__ == "__main__":
+    app = ChessApp()
+    app.mainloop()
